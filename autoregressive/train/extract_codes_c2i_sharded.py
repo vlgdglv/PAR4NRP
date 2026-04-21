@@ -11,6 +11,7 @@ Output layout (matches what dataset/imagenet_sharded.py expects):
     keys: codes uint16 [N, num_aug, H*W], labels int32 [N]
 """
 import argparse
+import datetime
 import os
 import time
 
@@ -119,9 +120,13 @@ def main(args):
 
     flush()
     if rank == 0:
-        print(f"[rank0] DONE rank0 wrote {shard_idx} shards, {seen} imgs in {time.time()-t0:.1f}s")
+        print(f"[rank{rank}] DONE wrote {shard_idx} shards, {seen} imgs in {time.time()-t0:.1f}s")
+    else:
+        print(f"[rank{rank}] DONE wrote {shard_idx} shards, {seen} imgs in {time.time()-t0:.1f}s", flush=True)
+    # No end barrier: ranks finish at different times due to uneven parquet
+    # distribution; a barrier here risks NCCL watchdog timeouts. Each rank
+    # writes its own shards independently.
     if not args.debug:
-        dist.barrier()
         dist.destroy_process_group()
 
 

@@ -13,6 +13,12 @@ BATCH=${BATCH:-32}
 SHARD=${SHARD:-1024}
 WORKERS=${WORKERS:-8}
 
+# Ranks finish at different times (uneven parquet row counts); bump the NCCL
+# watchdog timeout well above the worst-case straggler window. Unit: seconds.
+export TORCH_NCCL_BLOCKING_WAIT=0
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_TIMEOUT=7200
+
 mkdir -p "$CODE_PATH"
 
 torchrun --nproc_per_node=${NPROC} --master_port=${MASTER_PORT:-29501} \
