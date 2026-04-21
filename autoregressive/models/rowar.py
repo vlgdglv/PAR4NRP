@@ -74,17 +74,7 @@ class RowARArgs:
 
 
 class RowARBlock(nn.Module):
-    """Same as PAR/LlamaGen TransformerBlock but takes (x, freqs_cis, mask).
-
-    Adds a per-layer zero-init query-attention gate (`q_attn_gate`). Reason:
-    LlamaGen's QK projections are trained for input = tok_emb(x_{r,c}); we
-    feed input = tok_emb(x_{r-1,c}) at query positions. That mismatch makes
-    pretrained attention actively misleading at init (loss > ln(V)). Gating
-    the query-position attention output by tanh(g), g init 0, lets the model
-    start as "skip attention at queries; rely on FFN+output_head over the
-    query input embedding," then learn to use attention as g grows away from 0.
-    Prefix positions are NOT gated — their input matches LlamaGen.
-    """
+    """Same as PAR/LlamaGen TransformerBlock but takes (x, freqs_cis, mask)."""
 
     def __init__(self, config: RowARArgs, drop_path: float):
         super().__init__()
@@ -97,18 +87,9 @@ class RowARBlock(nn.Module):
         self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        # Zero-init scalar gate; tanh keeps it in (-1, 1).
-        self.q_attn_gate = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x, freqs_cis, mask, q_start: Optional[int] = None):
-        attn_out = self.attention(self.attention_norm(x), freqs_cis, None, mask)
-        if q_start is not None:
-            gate = torch.tanh(self.q_attn_gate)
-            # Scale only the query-position rows of attn_out (in place via clone+assign).
-            attn_out = torch.cat(
-                [attn_out[:, :q_start], attn_out[:, q_start:] * gate], dim=1
-            )
-        h = x + self.drop_path(attn_out)
+    def forward(self, x, freqs_cis, mask):
+        h = x + self.drop_path(self.attention(self.attention_norm(x), freqs_cis, None, mask))
         out = h + self.drop_path(self.feed_forward(self.ffn_norm(h)))
         return out
 
@@ -292,12 +273,12 @@ class RowARTransformer(nn.Module):
         mask = self.attn_mask.to(device).unsqueeze(0).unsqueeze(0)                            # [1,1,S,S]
         freqs_cis = self.freqs_cis.to(device)
 
-        Q0 = 1 + H * W
         for layer in self.layers:
-            h = layer(h, freqs_cis, mask, q_start=Q0)
+            h = layer(h, freqs_cis, mask)
         h = self.norm(h)
 
         # Logits only at query positions.
+        Q0 = 1 + H * W
         logits = self.output(h[:, Q0:, :]).float()                                            # [B,H*W,V]
 
         if targets is None:
@@ -391,8 +372,6 @@ class RowARTransformer(nn.Module):
         out_q = out_q.transpose(1, 2).contiguous().view(B, W, dim)
         out_p = att.resid_dropout(att.wo(out_p))
         out_q = att.resid_dropout(att.wo(out_q))
-        # Zero-init query-attention gate (matches _forward_train semantics).
-        out_q = out_q * torch.tanh(layer.q_attn_gate)
         x_p = x_p + out_p
         x_q = x_q + out_q
 
