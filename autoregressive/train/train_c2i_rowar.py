@@ -14,6 +14,7 @@ Differences:
 """
 import argparse
 import inspect
+import math
 import os
 import time
 from copy import deepcopy
@@ -123,6 +124,18 @@ def main(args):
 
     optimizer = create_optimizer(model, args.weight_decay, args.lr, (args.beta1, args.beta2), logger)
 
+    def lr_at(step, total):
+        """Linear warmup -> cosine decay to lr_min_ratio*lr. Disabled if --no-lr-schedule."""
+        if args.no_lr_schedule:
+            return args.lr
+        warm = max(1, args.warmup_steps)
+        if step < warm:
+            return args.lr * step / warm
+        progress = (step - warm) / max(1, total - warm)
+        progress = min(max(progress, 0.0), 1.0)
+        cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return args.lr * (args.lr_min_ratio + (1.0 - args.lr_min_ratio) * cos)
+
     # ---- data ----
     dataset = ShardedCodeDataseInRAM(
         code_dir=os.path.join(args.code_path, f"imagenet{args.image_size}_codes_sharded")
@@ -190,6 +203,10 @@ def main(args):
             with torch.cuda.amp.autocast(dtype=ptdtype):
                 _, loss = model(tokens=tokens, class_idx=y)
 
+            cur_lr = lr_at(train_steps, total_steps)
+            for pg in optimizer.param_groups:
+                pg["lr"] = cur_lr
+
             scaler.scale(loss).backward()
             if args.max_grad_norm > 0:
                 scaler.unscale_(optimizer)
@@ -218,12 +235,14 @@ def main(args):
                 eta_string = str(datetime.timedelta(seconds=eta_seconds))
 
                 logger.info(f"step={train_steps:07d}/{total_steps} loss={avg_loss:.4f} "
+                            f"lr={cur_lr:.2e} "
                             f"steps/s={steps_per_sec:.2f} epoch={epoch}/{args.epochs} "
                             f"eta={eta_string}")
 
                 if rank == 0 and args.wandb_project is not None:
                     wandb.log({
                         "train/loss": avg_loss,
+                        "train/lr": cur_lr,
                         "train/steps_per_sec": steps_per_sec,
                         "train/epoch": epoch,
                         "train/eta_hours": eta_seconds / 3600.0,
@@ -275,6 +294,11 @@ if __name__ == "__main__":
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--global-batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--warmup-steps", type=int, default=1000)
+    p.add_argument("--lr-min-ratio", type=float, default=0.1,
+                   help="cosine floor as a fraction of peak lr")
+    p.add_argument("--no-lr-schedule", action="store_true",
+                   help="disable warmup+cosine and use constant --lr")
     p.add_argument("--weight-decay", type=float, default=5e-2)
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
