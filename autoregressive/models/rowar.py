@@ -74,7 +74,17 @@ class RowARArgs:
 
 
 class RowARBlock(nn.Module):
-    """Same as PAR/LlamaGen TransformerBlock but takes (x, freqs_cis, mask)."""
+    """Same as PAR/LlamaGen TransformerBlock but takes (x, freqs_cis, mask).
+
+    Adds a per-layer zero-init query-attention gate (`q_attn_gate`). Reason:
+    LlamaGen's QK projections are trained for input = tok_emb(x_{r,c}); we
+    feed input = tok_emb(x_{r-1,c}) at query positions. That mismatch makes
+    pretrained attention actively misleading at init (loss > ln(V)). Gating
+    the query-position attention output by tanh(g), g init 0, lets the model
+    start as "skip attention at queries; rely on FFN+output_head over the
+    query input embedding," then learn to use attention as g grows away from 0.
+    Prefix positions are NOT gated — their input matches LlamaGen.
+    """
 
     def __init__(self, config: RowARArgs, drop_path: float):
         super().__init__()
@@ -87,9 +97,18 @@ class RowARBlock(nn.Module):
         self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        # Zero-init scalar gate; tanh keeps it in (-1, 1).
+        self.q_attn_gate = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x, freqs_cis, mask):
-        h = x + self.drop_path(self.attention(self.attention_norm(x), freqs_cis, None, mask))
+    def forward(self, x, freqs_cis, mask, q_start: Optional[int] = None):
+        attn_out = self.attention(self.attention_norm(x), freqs_cis, None, mask)
+        if q_start is not None:
+            gate = torch.tanh(self.q_attn_gate)
+            # Scale only the query-position rows of attn_out (in place via clone+assign).
+            attn_out = torch.cat(
+                [attn_out[:, :q_start], attn_out[:, q_start:] * gate], dim=1
+            )
+        h = x + self.drop_path(attn_out)
         out = h + self.drop_path(self.feed_forward(self.ffn_norm(h)))
         return out
 
@@ -212,7 +231,11 @@ class RowARTransformer(nn.Module):
 
     def initialize_weights(self):
         self.apply(self._init_weights)
-        nn.init.constant_(self.output.weight, 0)
+        # NOTE: do NOT zero-init output.weight. Zero-init is only safe when the
+        # output head is fully warm-started; if the ckpt load silently skips it,
+        # the model trains the head from zero and plateaus badly (observed on
+        # the 256 run at step 7500: output.weight std = 0.0186 vs 0.035 for
+        # warm-started tensors). Standard std=0.02 init is robust either way.
         nn.init.normal_(self.bos_row, mean=0.0, std=self.config.initializer_range)
 
     def _init_weights(self, module):
@@ -269,12 +292,12 @@ class RowARTransformer(nn.Module):
         mask = self.attn_mask.to(device).unsqueeze(0).unsqueeze(0)                            # [1,1,S,S]
         freqs_cis = self.freqs_cis.to(device)
 
+        Q0 = 1 + H * W
         for layer in self.layers:
-            h = layer(h, freqs_cis, mask)
+            h = layer(h, freqs_cis, mask, q_start=Q0)
         h = self.norm(h)
 
         # Logits only at query positions.
-        Q0 = 1 + H * W
         logits = self.output(h[:, Q0:, :]).float()                                            # [B,H*W,V]
 
         if targets is None:
@@ -368,6 +391,8 @@ class RowARTransformer(nn.Module):
         out_q = out_q.transpose(1, 2).contiguous().view(B, W, dim)
         out_p = att.resid_dropout(att.wo(out_p))
         out_q = att.resid_dropout(att.wo(out_q))
+        # Zero-init query-attention gate (matches _forward_train semantics).
+        out_q = out_q * torch.tanh(layer.q_attn_gate)
         x_p = x_p + out_p
         x_q = x_q + out_q
 
@@ -456,9 +481,25 @@ class RowARTransformer(nn.Module):
         # also report own keys that received nothing (i.e. fresh-init in our model)
         loaded_set = set(loaded)
         fresh = [k for k in own.keys() if k not in loaded_set]
+
+        # Hard-assert the tensors whose cold-init would cripple training.
+        critical = ["output.weight", "tok_embeddings.weight",
+                    "cls_embedding.embedding_table.weight"]
+        missing_critical = [k for k in critical if k not in loaded_set]
+        if missing_critical:
+            raise RuntimeError(
+                f"[RowAR.load_llamagen] CRITICAL tensors not warm-started: "
+                f"{missing_critical}. Check that the checkpoint contains these keys "
+                f"and shapes match. Training with these cold-init will plateau."
+            )
+
         if verbose:
             print(f"[RowAR.load_llamagen] loaded {len(loaded)} tensors, "
                   f"skipped {len(skipped)} from ckpt, fresh-init {len(fresh)} in model")
+            for k in critical:
+                t = own[k].float()
+                print(f"  [warm-start check] {k} std={t.std().item():.4f} "
+                      f"abs_max={t.abs().max().item():.4f}")
             if skipped:
                 print("  skipped (in ckpt, not used):")
                 for k, sh in skipped[:20]:
