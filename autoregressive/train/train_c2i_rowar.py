@@ -18,7 +18,8 @@ import os
 import time
 from copy import deepcopy
 from glob import glob
-
+import wandb
+import datetime
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -29,11 +30,12 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 from autoregressive.models.rowar import RowAR_models
-from dataset.imagenet_sharded import ShardedCodeDataset
+from dataset.imagenet_sharded import ShardedCodeDataset, ShardedCodeDataseInRAM
 from utils.distributed import init_distributed_mode
 from utils.ema import requires_grad, update_ema
 from utils.logger import create_logger
 
+os.environ["WANDB_SETTINGS_DISABLE_STATS"] = "true"
 
 def create_optimizer(model, weight_decay, lr, betas, logger):
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
@@ -68,6 +70,14 @@ def main(args):
         os.makedirs(ckpt_dir, exist_ok=True)
         logger = create_logger(args.results_dir)
         logger.info(f"args: {args}")
+
+        if args.wandb_project is not None:
+            wandb.init(
+                project=args.wandb_project,
+                name=os.path.basename(args.results_dir.strip("/")),
+                dir=args.wandb_dir,
+                config=vars(args)
+            )
     else:
         logger = create_logger(None)
 
@@ -114,7 +124,7 @@ def main(args):
     optimizer = create_optimizer(model, args.weight_decay, args.lr, (args.beta1, args.beta2), logger)
 
     # ---- data ----
-    dataset = ShardedCodeDataset(
+    dataset = ShardedCodeDataseInRAM(
         code_dir=os.path.join(args.code_path, f"imagenet{args.image_size}_codes_sharded")
     )
     sampler = DistributedSampler(dataset, shuffle=True, seed=args.global_seed)
@@ -126,6 +136,7 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        prefetch_factor=4,
     )
     logger.info(f"dataset: {len(dataset):,} images, {len(dataset.shard_files)} shards")
 
@@ -162,6 +173,8 @@ def main(args):
     H = W = latent_size
 
     logger.info(f"training for {args.epochs} epochs, bs={args.global_batch_size}")
+    total_steps = args.epochs * len(loader)
+
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         for x, y in loader:
@@ -198,8 +211,24 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"step={train_steps:07d} loss={avg_loss:.4f} "
-                            f"steps/s={log_steps/dt:.2f} epoch={epoch}")
+                steps_per_sec = log_steps / dt
+                time_per_step = dt / log_steps
+                remaining_steps = total_steps - train_steps
+                eta_seconds = int(max(0, remaining_steps) * time_per_step)
+                eta_string = str(datetime.timedelta(seconds=eta_seconds))
+
+                logger.info(f"step={train_steps:07d}/{total_steps} loss={avg_loss:.4f} "
+                            f"steps/s={steps_per_sec:.2f} epoch={epoch}/{args.epochs} "
+                            f"eta={eta_string}")
+
+                if rank == 0 and args.wandb_project is not None:
+                    wandb.log({
+                        "train/loss": avg_loss,
+                        "train/steps_per_sec": steps_per_sec,
+                        "train/epoch": epoch,
+                        "train/eta_hours": eta_seconds / 3600.0,
+                    }, step=train_steps)
+
                 running_loss, log_steps, t_log = 0.0, 0, time.time()
 
             if train_steps % args.ckpt_every == 0 and train_steps > 0 and rank == 0:
@@ -219,6 +248,8 @@ def main(args):
                 dist.barrier()
 
     logger.info("done")
+    if rank == 0 and args.wandb_project is not None:
+        wandb.finish()
     dist.destroy_process_group()
 
 
@@ -257,5 +288,7 @@ if __name__ == "__main__":
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--ckpt-every", type=int, default=5000)
     p.add_argument("--no-compile", action="store_true")
+    p.add_argument("--wandb-project", type=str, default=None)
+    p.add_argument("--wandb_dir", type=str, default="/dockerdata/bht/LlamaGenNRP/wandb")
     args = p.parse_args()
     main(args)

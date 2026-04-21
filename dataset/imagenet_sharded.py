@@ -8,10 +8,11 @@ import glob
 import os
 from typing import List, Optional
 
+from tqdm import tqdm
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
+import torch.distributed as dist
 
 class ShardedCodeDataset(Dataset):
     def __init__(self, code_dir: str, glob_pattern: str = "shard_*.npz"):
@@ -61,6 +62,44 @@ class ShardedCodeDataset(Dataset):
         label = int(self._cache_labels[local])
         # Match PAR's CustomDataset return contract: tensor codes + tensor label.
         return torch.from_numpy(codes.astype(np.int64)), torch.tensor([label], dtype=torch.long)
+
+
+class ShardedCodeDataseInRAM(Dataset):
+    def __init__(self, code_dir: str, glob_pattern: str = "shard_*.npz"):
+        self.code_dir = code_dir
+        self.shard_files: List[str] = sorted(
+            glob.glob(os.path.join(code_dir, glob_pattern))
+        )
+        if not self.shard_files:
+            raise FileNotFoundError(f"no shards matching {glob_pattern} under {code_dir}")
+
+        codes_list = []
+        labels_list = []
+
+        iterator = tqdm(self.shard_files, desc=f"Loading Codes to RAM") if dist.get_rank() == 0 else self.shard_files
+        for f in iterator:
+            with np.load(f) as z:
+                codes_list.append(z["codes"])
+                labels_list.append(z["labels"])
+        
+        self.all_codes = np.concatenate(codes_list, axis=0)
+        self.all_labels = np.concatenate(labels_list, axis=0)
+        self.total = self.all_labels.shape[0]
+        
+        # Compatibility shims for utilities that probe these attributes.
+        self.flip = True  # flip aug is baked into num_aug=2
+        self.feature_dir = code_dir
+        self.aug_feature_dir = None
+
+    def __len__(self) -> int:
+        return self.total
+
+    def __getitem__(self, idx: int):
+        codes = self.all_codes[idx]   # [num_aug, H*W] uint16
+        label = int(self.all_labels[idx])
+        # Match PAR's CustomDataset return contract: tensor codes + tensor label.
+        return torch.from_numpy(codes.astype(np.int64)), torch.tensor([label], dtype=torch.long)
+
 
 
 def build_imagenet_sharded(args, **kwargs):

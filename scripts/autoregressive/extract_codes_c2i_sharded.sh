@@ -6,7 +6,7 @@ set -euo pipefail
 
 DATA_PATH=${DATA_PATH:-/jizhicfs/pkuhetu/bht/data/imagenet-1k/data}
 CODE_PATH=${CODE_PATH:-/jizhicfs/pkuhetu/bht/data/imagenet-1k/codes}
-VQ_CKPT=${VQ_CKPT:-/jizhicfs/pkuhetu/bht/data/imagenet-1k/vq_ds16_c2i.pt}
+VQ_CKPT=${VQ_CKPT:-/jizhicfs/pkuhetu/bht/model_home/LlamaGen/vq_ds16_c2i.pt}
 NPROC=${NPROC:-8}
 IMG=${IMG:-384}
 BATCH=${BATCH:-32}

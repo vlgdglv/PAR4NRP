@@ -3,10 +3,10 @@
 set -euo pipefail
 
 CODE_PATH=${CODE_PATH:-/jizhicfs/pkuhetu/bht/data/imagenet-1k/codes}
-LLAMAGEN_CKPT=${LLAMAGEN_CKPT:-/jizhicfs/pkuhetu/bht/data/imagenet-1k/c2i_B_384.pt}
-RESULTS=${RESULTS:-/jizhicfs/pkuhetu/bht/results/rowar_b_init}
+LLAMAGEN_CKPT=${LLAMAGEN_CKPT:-/jizhicfs/pkuhetu/bht/model_home/LlamaGen/c2i_B_384.pt}
+RESULTS=${RESULTS:-/dockerdata/bht/LlamaGenNRP/rowar_b_init}
 NPROC=${NPROC:-8}
-BS=${BS:-256}
+BS=${BS:-512}
 EPOCHS=${EPOCHS:-300}
 LR=${LR:-1e-4}
 MODEL=${MODEL:-RowAR-B}
@@ -24,6 +24,7 @@ torchrun --nproc_per_node=${NPROC} --master_port=${MASTER_PORT:-29502} \
     --lr ${LR} \
     --ema \
     --results-dir "$RESULTS" \
-    --num-workers 8 \
+    --num-workers 16 \
     --log-every 50 \
-    --ckpt-every 5000
+    --ckpt-every 5000 \
+    --wandb-project LlamaGenNRP
