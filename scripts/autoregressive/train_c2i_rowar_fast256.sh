@@ -4,18 +4,18 @@
 set -euo pipefail
 
 CODE_PATH=${CODE_PATH:-/jizhicfs/pkuhetu/bht/data/imagenet-1k/codes}
-LLAMAGEN_CKPT=${LLAMAGEN_CKPT:-/jizhicfs/pkuhetu/bht/data/imagenet-1k/c2i_B_256.pt}
-RESULTS=${RESULTS:-/jizhicfs/pkuhetu/bht/results/rowar_b_256_fast}
+LLAMAGEN_CKPT=${LLAMAGEN_CKPT:-/jizhicfs/pkuhetu/bht/model_home/LlamaGen/c2i_B_256.pt}
+RESULTS=${RESULTS:-/dockerdata/bht/LlamaGenNRP/rowar_b_256_fast}
 NPROC=${NPROC:-8}
 BS=${BS:-2048}          # 80% VRAM on 8xH20 at 256 (seq len 513)
-EPOCHS=${EPOCHS:-60}    # sqrt-scaled LR + cosine: 60 is enough for signal
+EPOCHS=${EPOCHS:-25}    # sqrt-scaled LR + cosine: 60 is enough for signal
 LR=${LR:-2e-4}          # sqrt(BS/512) * 1e-4 = 2e-4 at BS=2048
 WARMUP=${WARMUP:-1000}
 MODEL=${MODEL:-RowAR-B}
 
 mkdir -p "$RESULTS"
 
-torchrun --nproc_per_node=${NPROC} --master_port=${MASTER_PORT:-29502} \
+torchrun --nproc_per_node=${NPROC} --master_port=${MASTER_PORT:-26312} \
     autoregressive/train/train_c2i_rowar.py \
     --code-path "$CODE_PATH" \
     --image-size 256 \
@@ -30,4 +30,5 @@ torchrun --nproc_per_node=${NPROC} --master_port=${MASTER_PORT:-29502} \
     --results-dir "$RESULTS" \
     --num-workers 8 \
     --log-every 50 \
-    --ckpt-every 2500
+    --ckpt-every 2500 \
+    --wandb-project LlamaGenNRP

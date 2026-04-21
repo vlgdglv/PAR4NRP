@@ -75,8 +75,9 @@ class ShardedCodeDataseInRAM(Dataset):
 
         codes_list = []
         labels_list = []
+        is_main_process = not dist.is_initialized() or dist.get_rank() == 0
 
-        iterator = tqdm(self.shard_files, desc=f"Loading Codes to RAM") if dist.get_rank() == 0 else self.shard_files
+        iterator = tqdm(self.shard_files, desc=f"Loading Codes to RAM") if is_main_process else self.shard_files
         for f in iterator:
             with np.load(f) as z:
                 codes_list.append(z["codes"])

@@ -13,7 +13,7 @@ python autoregressive/sample/sample_c2i_rowar.py \
     --model "$MODEL" \
     --gpt-ckpt "$GPT_CKPT" \
     --vq-ckpt "$VQ_CKPT" \
-    --image-size 384 \
+    --image-size 256 \
     --cfg-scale ${CFG} \
     --top-k ${TOPK} \
     --temperature 1.0 \
