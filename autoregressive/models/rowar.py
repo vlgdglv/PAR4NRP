@@ -17,9 +17,12 @@ Attention mask (block-causal, bidirectional within block):
   Position in block r attends to: CLS + all positions in blocks 0..r
   (i.e. self-block is bidirectional; prior blocks fully visible).
 
-2D RoPE keyed by (row, col):
-  CLS -> zero rotation.
-  Position (r, c) (block r, column c) -> 2D RoPE at (r, c).
+1D RoPE over the flat sequence (LlamaGen convention):
+  Position p in [0, 1+H*W) gets standard llama-style 1D RoPE at index p.
+  CLS at p=0 receives identity rotation. The 'row' structure of RowAR is
+  enforced ONLY by the attention mask, not by positional encoding -- this
+  keeps Q/K projections in the same rotation regime they were warm-started
+  in, so attention patterns transfer instead of being scrambled by a 2D split.
 
 Why this beats the V1 dual-block design:
   V1 had [CLS, prefix(H*W), queries(H*W)] (length 1+2HW). The query Q-projection
@@ -98,29 +101,25 @@ class RowARBlock(nn.Module):
 
 
 def build_row_freqs_cis(H: int, W: int, head_dim: int, base: float = 10000.0):
-    """2D RoPE for the V2 single-block layout, length 1 + H*W.
-    Position 0 (CLS) -> zeros (no rotation). Position 1+r*W+c -> 2D RoPE at (r, c).
+    """1D RoPE over the flat sequence [CLS, block_0, block_1, ..., block_{H-1}],
+    length 1 + H*W. Matches LlamaGen's standard 1D positional convention so that
+    attention weights warm-started from a c2i raster checkpoint operate in the
+    same rotation regime they were trained in. The 'row' structure of RowAR is
+    expressed entirely through the block-causal attention mask, not through RoPE.
+
     Returns tensor of shape (1 + H*W, head_dim // 2, 2).
+    Position 0 (CLS) gets zero angle (cos=1, sin=0 -> identity rotation), which
+    is the natural index-0 case of the formula -- no special handling needed.
     """
     assert head_dim % 2 == 0
-    half_dim = head_dim // 2
-    per_axis = half_dim // 2
-    assert per_axis > 0, "head_dim too small for 2D RoPE"
-
-    freqs = 1.0 / (base ** (torch.arange(0, half_dim, 2)[:per_axis].float() / half_dim))
-    t_r = torch.arange(H, dtype=torch.float32)
-    t_c = torch.arange(W, dtype=torch.float32)
-    row_freqs = torch.outer(t_r, freqs)   # (H, per_axis)
-    col_freqs = torch.outer(t_c, freqs)   # (W, per_axis)
-
-    row_grid = row_freqs[:, None, :].expand(H, W, per_axis)
-    col_grid = col_freqs[None, :, :].expand(H, W, per_axis)
-    grid = torch.cat([row_grid, col_grid], dim=-1)             # (H, W, half_dim)
-    cache = torch.stack([torch.cos(grid), torch.sin(grid)], dim=-1)  # (H, W, half_dim, 2)
-    cache = cache.reshape(H * W, half_dim, 2)
-
-    cls_part = torch.zeros(1, half_dim, 2)
-    return torch.cat([cls_part, cache], dim=0)                  # (1 + H*W, half_dim, 2)
+    half = head_dim // 2
+    # Llama-style: freq_i = 1 / base^(2i/d), i in [0, half)
+    freqs = 1.0 / (base ** (torch.arange(0, half, dtype=torch.float32) * 2 / head_dim))
+    S = 1 + H * W
+    t = torch.arange(S, dtype=torch.float32)
+    angles = torch.outer(t, freqs)                                   # (S, half)
+    cache = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)  # (S, half, 2)
+    return cache
 
 
 def build_row_attn_mask(H: int, W: int) -> torch.Tensor:
