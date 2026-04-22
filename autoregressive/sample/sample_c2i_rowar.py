@@ -51,35 +51,76 @@ def sample_tokens(logits: torch.Tensor, temperature: float, top_k: int, top_p: f
     return tok
 
 
+def sample_one(logits: torch.Tensor, temperature: float, top_k: int, top_p: float,
+               greedy: bool = False) -> torch.Tensor:
+    """logits: [B, V] -> [B] long. Per-column sampler for the AR head."""
+    flat = logits / max(temperature, 1e-5)
+    flat = top_k_top_p_filter(flat, top_k=top_k, top_p=top_p)
+    if greedy:
+        return flat.argmax(dim=-1)
+    probs = F.softmax(flat, dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
 @torch.no_grad()
 def generate_rowar(model, class_idx: torch.Tensor, H: int, W: int,
                    cfg_scale: float = 1.0, temperature: float = 1.0,
                    top_k: int = 0, top_p: float = 1.0, greedy: bool = False):
-    """Returns flat token grid [B, H*W] and per-step latency list."""
+    """Returns flat token grid [B, H*W] and per-step latency list.
+
+    Two-stage per row:
+      1. Trunk forward -> h_row [B, W, d_trunk] for this row (KV-cached).
+      2. AR head walks W columns, each column sees (h_row, already-sampled tokens).
+    With CFG, trunk is run on 2B (cond+uncond) and head is run twice per column.
+    """
     B = class_idx.shape[0]
     device = class_idx.device
-    prev_rows = None  # will become [B, r, W]
-
-    # For CFG we batch cond + uncond in a single forward per step.
-    null_cls = torch.full_like(class_idx, model.config.num_classes)  # null label slot
+    prev_rows = None
+    null_cls = torch.full_like(class_idx, model.config.num_classes)
+    use_head = getattr(model, "use_head", False) and hasattr(model, "head")
     step_times = []
 
-    # Fresh KV cache for this batch.
     if hasattr(model, "reset_kv_cache"):
         model.reset_kv_cache()
 
     for r in range(H):
         t0 = time.time()
+        # ---- stage 1: trunk -> h_row ----
         if cfg_scale > 1.0:
             both_cls = torch.cat([class_idx, null_cls], dim=0)
             both_prev = None if prev_rows is None else torch.cat([prev_rows, prev_rows], dim=0)
-            logits = model(tokens=None, class_idx=both_cls, prev_rows=both_prev)  # [2B, W, V]
-            cond, uncond = logits.chunk(2, dim=0)
-            logits = uncond + cfg_scale * (cond - uncond)
+            h_out = model(tokens=None, class_idx=both_cls, prev_rows=both_prev)
         else:
-            logits = model(tokens=None, class_idx=class_idx, prev_rows=prev_rows)
+            h_out = model(tokens=None, class_idx=class_idx, prev_rows=prev_rows)
 
-        new_row = sample_tokens(logits, temperature, top_k, top_p, greedy=greedy)  # [B, W]
+        # ---- stage 2: within-row AR ----
+        if use_head:
+            if cfg_scale > 1.0:
+                h_c, h_u = h_out.chunk(2, dim=0)                         # [B, W, d_trunk] each
+            else:
+                h_c = h_out
+            sampled = torch.empty(B, 0, dtype=torch.long, device=device)
+            for c in range(W):
+                if cfg_scale > 1.0:
+                    l_c = model.head.step_logits(h_c, sampled)           # [B, V]
+                    l_u = model.head.step_logits(h_u, sampled)
+                    logits_c = l_u + cfg_scale * (l_c - l_u)
+                else:
+                    logits_c = model.head.step_logits(h_c, sampled)
+                tok_c = sample_one(logits_c.float(), temperature, top_k, top_p, greedy=greedy)
+                sampled = torch.cat([sampled, tok_c.unsqueeze(1)], dim=1)
+            new_row = sampled
+        else:
+            # No head: legacy factorized sampling from trunk logits.
+            if cfg_scale > 1.0:
+                h_c, h_u = h_out.chunk(2, dim=0)
+                l_c = model.output(h_c).float()
+                l_u = model.output(h_u).float()
+                logits = l_u + cfg_scale * (l_c - l_u)
+            else:
+                logits = model.output(h_out).float()
+            new_row = sample_tokens(logits, temperature, top_k, top_p, greedy=greedy)
+
         prev_rows = new_row.unsqueeze(1) if prev_rows is None else torch.cat(
             [prev_rows, new_row.unsqueeze(1)], dim=1
         )

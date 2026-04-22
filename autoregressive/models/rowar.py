@@ -82,6 +82,19 @@ class RowARArgs:
     grid_w: int = 24
     cls_token_num: int = 1
 
+    # Tiny within-row AR head. Trunk predicts row r in parallel (factorized
+    # marginals); head walks across the W columns and conditions on previously
+    # sampled tokens of the same row, so inference is no longer factorized.
+    use_head: bool = True
+    head_dim: int = 384
+    head_n_layer: int = 2
+    head_n_head: int = 6
+    # Loss weight on trunk's own factorized CE. Head loss is always 1.0.
+    # Keeping trunk loss > 0 prevents the trunk from "outsourcing" all
+    # within-row work to the head and stops its hidden states from drifting
+    # into an arbitrary internal code only the head can read.
+    trunk_loss_weight: float = 1.0
+
 
 class RowARBlock(nn.Module):
     """Llama transformer block adapted to (x, freqs_cis, mask) signature."""
@@ -141,6 +154,143 @@ def build_row_attn_mask(H: int, W: int) -> torch.Tensor:
     return mask
 
 
+class TinyBlock(nn.Module):
+    """Minimal pre-norm transformer block, causal SDPA, GELU MLP."""
+
+    def __init__(self, dim: int, n_head: int):
+        super().__init__()
+        assert dim % n_head == 0
+        self.n_head = n_head
+        self.head_dim = dim // n_head
+        self.norm1 = RMSNorm(dim)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.wo = nn.Linear(dim, dim, bias=False)
+        self.norm2 = RMSNorm(dim)
+        self.ff_w1 = nn.Linear(dim, 4 * dim, bias=False)
+        self.ff_w2 = nn.Linear(4 * dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        B, L, _ = h.shape
+        qkv = self.qkv(h).view(B, L, 3, self.n_head, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2); k = k.transpose(1, 2); v = v.transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = out.transpose(1, 2).contiguous().view(B, L, -1)
+        x = x + self.wo(out)
+        x = x + self.ff_w2(F.gelu(self.ff_w1(self.norm2(x))))
+        return x
+
+
+class TinyARHead(nn.Module):
+    """Within-row autoregressive head.
+
+    Inputs per column c (0 <= c < W):
+      cond_c  = proj_in(h_row[:, c, :])           # trunk's row hidden state at col c
+      tok_c   = bos                  if c == 0
+                tok_emb(x_{r, c-1})  if c >= 1    # previous token in same row
+      x_c     = cond_c + tok_c + pos_emb[c]
+
+    Causal self-attention over the W positions; each column attends to itself
+    and prior columns. Output: per-column logits over the VQ vocab.
+
+    Why additive cond + tok rather than concat: keeps the head dim fixed and
+    matches the magnitudes the trunk hidden states already live in. Direct CE
+    supervision on the head output ensures gradient flows into tok_emb / qkv
+    of the head; nothing prevents the head from using prev tokens, and it
+    will, because that's the only path to lower CE on positions where the
+    factorized trunk is wrong.
+
+    Inference: KV cache grows by one position per column. W steps per row.
+    Cost ~5% of trunk per row at d_head=384, n_layer=2.
+    """
+
+    def __init__(
+        self,
+        d_trunk: int,
+        d_head: int,
+        n_layer: int,
+        n_head: int,
+        vocab_size: int,
+        W: int,
+        initializer_range: float = 0.02,
+    ):
+        super().__init__()
+        self.W = W
+        self.d_head = d_head
+        self.n_head = n_head
+        self.head_dim_attn = d_head // n_head
+        self.proj_in = nn.Linear(d_trunk, d_head, bias=False)
+        self.tok_emb = nn.Embedding(vocab_size, d_head)
+        self.bos = nn.Parameter(torch.zeros(d_head))
+        self.pos_emb = nn.Parameter(torch.zeros(W, d_head))
+        self.layers = nn.ModuleList([TinyBlock(d_head, n_head) for _ in range(n_layer)])
+        self.norm = RMSNorm(d_head)
+        self.out = nn.Linear(d_head, vocab_size, bias=False)
+
+        # Standard small-init; head is fresh (no warm-start source).
+        std = initializer_range
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=std)
+        nn.init.normal_(self.bos, mean=0.0, std=std)
+        nn.init.normal_(self.pos_emb, mean=0.0, std=std)
+        nn.init.normal_(self.proj_in.weight, mean=0.0, std=std)
+        nn.init.normal_(self.out.weight, mean=0.0, std=std)
+        for blk in self.layers:
+            nn.init.normal_(blk.qkv.weight, mean=0.0, std=std)
+            nn.init.normal_(blk.wo.weight, mean=0.0, std=std)
+            nn.init.normal_(blk.ff_w1.weight, mean=0.0, std=std)
+            nn.init.normal_(blk.ff_w2.weight, mean=0.0, std=std)
+
+    def _assemble_inputs(self, cond: torch.Tensor, prev_tokens: torch.Tensor) -> torch.Tensor:
+        """cond: [B, L, d_head]; prev_tokens: [B, L] long where prev_tokens[:, 0] is unused
+        (replaced by bos). Returns [B, L, d_head].
+        """
+        B, L = prev_tokens.shape
+        tok = self.tok_emb(prev_tokens)                 # [B, L, d_head]
+        tok = tok.clone()
+        tok[:, 0] = self.bos
+        return cond + tok + self.pos_emb[:L].unsqueeze(0)
+
+    def forward(self, h_row: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """Teacher-forced parallel forward (training).
+        h_row:  [B, W, d_trunk]   trunk hidden state at this row's W positions
+        tokens: [B, W] long       ground-truth row (column c sees tokens[:, c-1])
+        returns logits [B, W, V]
+        """
+        B, W = tokens.shape
+        prev = torch.zeros_like(tokens)
+        prev[:, 1:] = tokens[:, :-1]                    # col 0 prev: dummy, overwritten by bos
+        cond = self.proj_in(h_row)
+        x = self._assemble_inputs(cond, prev)
+        for layer in self.layers:
+            x = layer(x)
+        return self.out(self.norm(x))                   # [B, W, V]
+
+    @torch.no_grad()
+    def step_logits(self, h_row: torch.Tensor, sampled_so_far: torch.Tensor) -> torch.Tensor:
+        """Logits at the next column to sample.
+        h_row: [B, W, d_trunk]
+        sampled_so_far: [B, c] long, 0 <= c < W
+        returns [B, V] logits at column c.
+
+        Simple O(W^2) implementation: re-runs first c+1 positions each call.
+        At W=16 with a 2-layer dim-384 head this is well under 1ms / row;
+        we don't bother with KV cache yet.
+        """
+        B = h_row.shape[0]
+        c = sampled_so_far.shape[1]
+        L = c + 1
+        device = h_row.device
+        prev = torch.zeros(B, L, dtype=torch.long, device=device)
+        if c > 0:
+            prev[:, 1:] = sampled_so_far                # col 0 prev: dummy -> bos
+        cond = self.proj_in(h_row[:, :L])
+        x = self._assemble_inputs(cond, prev)
+        for layer in self.layers:
+            x = layer(x)
+        return self.out(self.norm(x[:, -1]))            # [B, V]
+
+
 class RowARTransformer(nn.Module):
     def __init__(self, config: RowARArgs):
         super().__init__()
@@ -163,6 +313,18 @@ class RowARTransformer(nn.Module):
         self.layers = nn.ModuleList([RowARBlock(config, dpr[i]) for i in range(config.n_layer)])
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+
+        self.use_head = config.use_head
+        if self.use_head:
+            self.head = TinyARHead(
+                d_trunk=config.dim,
+                d_head=config.head_dim,
+                n_layer=config.head_n_layer,
+                n_head=config.head_n_head,
+                vocab_size=config.vocab_size,
+                W=config.grid_w,
+                initializer_range=config.initializer_range,
+            )
 
         head_dim = config.dim // config.n_head
         self.register_buffer(
@@ -236,14 +398,40 @@ class RowARTransformer(nn.Module):
             h = layer(h, freqs_cis, mask)
         h = self.norm(h)
 
-        # Logits at data positions only (skip CLS).
-        logits = self.output(h[:, 1:, :]).float()                                             # [B,H*W,V]
+        # Trunk hidden states at data positions (skip CLS): [B, H, W, d]
+        h_data = h[:, 1:, :].view(B, H, W, -1)
+        d = h_data.shape[-1]
 
+        trunk_logits = self.output(h_data).float()                                            # [B,H,W,V]
         if targets is None:
             targets = tokens.reshape(B, H * W)
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)), targets.reshape(-1)
+        targets_hw = targets.view(B, H * W)
+        trunk_loss = F.cross_entropy(
+            trunk_logits.reshape(-1, trunk_logits.size(-1)), targets_hw.reshape(-1)
         )
+
+        if self.use_head:
+            # Run head on all H rows in parallel: pack rows into the batch dim.
+            h_row = h_data.reshape(B * H, W, d)                                               # [B*H,W,d]
+            row_tokens = tokens.reshape(B * H, W)                                             # [B*H,W]
+            head_logits = self.head(h_row, row_tokens).float()                                # [B*H,W,V]
+            head_loss = F.cross_entropy(
+                head_logits.reshape(-1, head_logits.size(-1)),
+                row_tokens.reshape(-1),
+            )
+            loss = self.config.trunk_loss_weight * trunk_loss + head_loss
+            # Expose components for logging.
+            self.last_loss_components = {
+                "loss_trunk": trunk_loss.detach(),
+                "loss_head": head_loss.detach(),
+            }
+            # Return head logits as the "primary" logits the caller sees.
+            logits = head_logits.view(B, H, W, -1).reshape(B, H * W, -1)
+        else:
+            loss = trunk_loss
+            self.last_loss_components = {"loss_trunk": trunk_loss.detach()}
+            logits = trunk_logits.reshape(B, H * W, -1)
+
         return logits, loss
 
     # ---------------------------------------------------------------- sampling
@@ -322,7 +510,23 @@ class RowARTransformer(nn.Module):
 
     @torch.no_grad()
     def _forward_step(self, prev_rows: Optional[torch.Tensor], class_idx: torch.Tensor):
-        """One row step with persistent KV cache.
+        """One row step with persistent KV cache. Returns the trunk's row hidden
+        state h_row of shape [B, W, d_trunk] -- NOT logits.
+
+        With the AR head present, sampling is no longer "argmax over W
+        independent marginals". The caller must run the head column-by-column:
+
+            h_row = model.forward(None, class_idx, prev_rows=prev_rows)
+            sampled = empty(B, 0)
+            for c in range(W):
+                logits_c = model.head.step_logits(h_row, sampled)   # [B, V]
+                tok_c = sample(logits_c, ...)
+                sampled = cat([sampled, tok_c.unsqueeze(1)], dim=1)
+            prev_rows = cat([prev_rows, sampled.unsqueeze(1)], dim=1)
+
+        For CFG: batch the (cond, uncond) class indices into dim 0 (size 2B),
+        run one trunk forward, split h_row, run head.step_logits on each, and
+        mix logits per column before sampling.
 
         Call order: H times with prev_rows of length 0, 1, ..., H-1.
         Cache grows internally; call reset_kv_cache() before a new sample.
@@ -361,10 +565,9 @@ class RowARTransformer(nn.Module):
             x = self._step_layer_cached(i, layer, x, freqs_step, chunk_mask)
 
         x = self.norm(x)
-        # Logits at block-r positions only (drop CLS slot at r==0).
-        logits_part = x[:, 1:, :] if r == 0 else x
-        logits = self.output(logits_part).float()                                            # [B, W, V]
-        return logits
+        # Return trunk row hidden states at block-r positions (drop CLS at r==0).
+        h_row = x[:, 1:, :] if r == 0 else x                                                 # [B, W, d_trunk]
+        return h_row
 
     # ---------------------------------------------------------------- ckpt I/O
     def load_llamagen_state_dict(self, state_dict: dict, verbose: bool = True):

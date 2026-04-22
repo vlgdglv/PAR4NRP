@@ -69,24 +69,58 @@ def main():
         assert codes.min() >= 0 and codes.max() < 16384
 
         # ---- KV-cache correctness: incremental cached forward vs training forward ----
-        # Feed ground-truth rows one-by-one and check the per-row logits match the
-        # all-at-once training forward at the matching query positions.
+        # Two parities to check now that we have a trunk + head:
+        #   (a) cached trunk h_row per row == training h_data[:, r] at that row
+        #   (b) head.step_logits column-by-column == head.forward parallel logits
         with torch.no_grad():
             tok_grid = codes.view(2, H, W).long()
-            train_logits, _ = model(tokens=tok_grid, class_idx=cls)   # [2, H*W, V]
-            train_logits = train_logits.view(2, H, W, -1)
 
+            # Rebuild training-path h_data and head parallel logits.
+            cls_emb = model.cls_embedding(cls, train=False)[:, :model.cls_token_num]
+            block_inputs = model._build_block_inputs(tok_grid)
+            h = torch.cat([cls_emb, block_inputs], dim=1)
+            mask = model.attn_mask.to(device).unsqueeze(0).unsqueeze(0)
+            freqs_cis = model.freqs_cis.to(device)
+            for layer in model.layers:
+                h = layer(h, freqs_cis, mask)
+            h = model.norm(h)
+            h_data_train = h[:, 1:, :].view(2, H, W, -1)                      # [2,H,W,d]
+
+            # (a) Trunk parity via cached step.
             model.reset_kv_cache()
             prev = None
-            max_abs = 0.0
+            max_trunk = 0.0
+            cached_h_rows = []
             for r in range(H):
-                step_logits = model(tokens=None, class_idx=cls, prev_rows=prev)  # [2, W, V]
-                diff = (step_logits.float() - train_logits[:, r].float()).abs().max().item()
-                max_abs = max(max_abs, diff)
+                h_row = model(tokens=None, class_idx=cls, prev_rows=prev)      # [2, W, d_trunk]
+                cached_h_rows.append(h_row)
+                diff = (h_row.float() - h_data_train[:, r].float()).abs().max().item()
+                max_trunk = max(max_trunk, diff)
                 row = tok_grid[:, r, :]
                 prev = row.unsqueeze(1) if prev is None else torch.cat([prev, row.unsqueeze(1)], dim=1)
-            print(f"KV-cache correctness: max|cached - train| = {max_abs:.2e}")
-            assert max_abs < 1e-3, f"cached logits diverge from training forward: {max_abs}"
+            print(f"[trunk] max|cached h_row - train h_row| = {max_trunk:.2e}")
+            assert max_trunk < 1e-3, f"trunk cached h diverges: {max_trunk}"
+
+            # (b) Head parity: parallel teacher-forced logits vs column-by-column step_logits.
+            if getattr(model, "use_head", False):
+                max_head = 0.0
+                for r in range(H):
+                    h_row_train = h_data_train[:, r]                           # [2, W, d_trunk]
+                    parallel_logits = model.head(h_row_train, tok_grid[:, r])  # [2, W, V]
+                    sampled = torch.empty(2, 0, dtype=torch.long, device=device)
+                    for c in range(W):
+                        step_l = model.head.step_logits(h_row_train, sampled)  # [2, V]
+                        diff = (step_l.float() - parallel_logits[:, c].float()).abs().max().item()
+                        max_head = max(max_head, diff)
+                        sampled = torch.cat([sampled, tok_grid[:, r, c:c+1]], dim=1)
+                print(f"[head]  max|step_logits - parallel_logits| = {max_head:.2e}")
+                assert max_head < 1e-3, f"head step diverges from parallel: {max_head}"
+
+            # Loss component sanity check.
+            _, _ = model(tokens=tok_grid, class_idx=cls)
+            comps = getattr(model, "last_loss_components", {})
+            print(f"[loss]  components: "
+                  + ", ".join(f"{k}={v.item():.3f}" for k, v in comps.items()))
 
 
 if __name__ == "__main__":
