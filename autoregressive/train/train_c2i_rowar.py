@@ -188,6 +188,7 @@ def main(args):
     scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision == "fp16"))
 
     running_loss, log_steps = 0.0, 0
+    running_trunk, running_head = 0.0, 0.0
     t_log = time.time()
     H = W = latent_size
 
@@ -225,6 +226,13 @@ def main(args):
                 update_ema(ema, target)
 
             running_loss += loss.item()
+            # Per-component losses exposed by RowARTransformer (head + trunk).
+            inner_model = model.module._orig_mod if not args.no_compile else model.module
+            comps = getattr(inner_model, "last_loss_components", {})
+            if "loss_trunk" in comps:
+                running_trunk += comps["loss_trunk"].item()
+            if "loss_head" in comps:
+                running_head += comps["loss_head"].item()
             log_steps += 1
             train_steps += 1
 
@@ -234,6 +242,12 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
+                avg_trunk = torch.tensor(running_trunk / log_steps, device=device)
+                dist.all_reduce(avg_trunk, op=dist.ReduceOp.SUM)
+                avg_trunk = avg_trunk.item() / dist.get_world_size()
+                avg_head = torch.tensor(running_head / log_steps, device=device)
+                dist.all_reduce(avg_head, op=dist.ReduceOp.SUM)
+                avg_head = avg_head.item() / dist.get_world_size()
                 steps_per_sec = log_steps / dt
                 time_per_step = dt / log_steps
                 remaining_steps = total_steps - train_steps
@@ -241,6 +255,8 @@ def main(args):
                 eta_string = str(datetime.timedelta(seconds=eta_seconds))
 
                 logger.info(f"step={train_steps:07d}/{total_steps} loss={avg_loss:.4f} "
+                            f"trunk={avg_trunk:.4f} head={avg_head:.4f} "
+                            f"gap={avg_trunk - avg_head:+.4f} "
                             f"lr={cur_lr:.2e} "
                             f"steps/s={steps_per_sec:.2f} epoch={epoch}/{args.epochs} "
                             f"eta={eta_string}")
@@ -248,6 +264,9 @@ def main(args):
                 if rank == 0 and args.wandb_project is not None:
                     wandb.log({
                         "train/loss": avg_loss,
+                        "train/loss_trunk": avg_trunk,
+                        "train/loss_head": avg_head,
+                        "train/loss_gap_trunk_minus_head": avg_trunk - avg_head,
                         "train/lr": cur_lr,
                         "train/steps_per_sec": steps_per_sec,
                         "train/epoch": epoch,
@@ -255,6 +274,7 @@ def main(args):
                     }, step=train_steps)
 
                 running_loss, log_steps, t_log = 0.0, 0, time.time()
+                running_trunk, running_head = 0.0, 0.0
 
             if train_steps % args.ckpt_every == 0 and train_steps > 0 and rank == 0:
                 target = model.module._orig_mod if not args.no_compile else model.module
