@@ -8,7 +8,7 @@ LLAMAGEN_CKPT=${LLAMAGEN_CKPT:-/jizhicfs/pkuhetu/bht/model_home/LlamaGen/c2i_B_2
 RESULTS=${RESULTS:-/dockerdata/bht/LlamaGenNRP/rowar_b_256_fast}
 NPROC=${NPROC:-8}
 BS=${BS:-2048}          # 80% VRAM on 8xH20 at 256 (seq len 513)
-EPOCHS=${EPOCHS:-25}    # sqrt-scaled LR + cosine: 60 is enough for signal
+EPOCHS=${EPOCHS:-60}    # sqrt-scaled LR + cosine: 60 is enough for signal
 LR=${LR:-2e-4}          # sqrt(BS/512) * 1e-4 = 2e-4 at BS=2048
 WARMUP=${WARMUP:-1000}
 MODEL=${MODEL:-RowAR-B}
@@ -16,7 +16,7 @@ MODEL=${MODEL:-RowAR-B}
 mkdir -p "$RESULTS"
 
 torchrun --nproc_per_node=${NPROC} --master_port=${MASTER_PORT:-26312} \
-    autoregressive/train/train_c2i_rowar.py \
+   -m autoregressive.train.train_c2i_rowar \
     --code-path "$CODE_PATH" \
     --image-size 256 \
     --model "$MODEL" \
@@ -30,5 +30,5 @@ torchrun --nproc_per_node=${NPROC} --master_port=${MASTER_PORT:-26312} \
     --results-dir "$RESULTS" \
     --num-workers 8 \
     --log-every 50 \
-    --ckpt-every 2500 \
-    --wandb-project LlamaGenNRP
+    --ckpt-every 2500
+    # --wandb-project LlamaGenNRP

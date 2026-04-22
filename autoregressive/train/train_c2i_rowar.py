@@ -65,6 +65,12 @@ def main(args):
     torch.cuda.set_device(device)
 
     # ---- experiment dirs ----
+    tag = (f"{args.model.lower()}-img{args.image_size}"                                                                                                                                                                                                         
+         f"-bs{args.global_batch_size}-lr{args.lr:.0e}"                                                                                                                                                                                                       
+         f"-ep{args.epochs}-wu{args.warmup_steps}"                                                                                                                                                                                                            
+         f"{'-ema' if args.ema else ''}"                                                                                                                                                                                                                      
+         f"{'-llamagen' if args.init_from_llamagen else '-scratch'}")                                                                                                                                                                                         
+    args.results_dir = os.path.join(args.results_dir, tag)
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
         ckpt_dir = os.path.join(args.results_dir, "checkpoints")
