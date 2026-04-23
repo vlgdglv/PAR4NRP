@@ -189,6 +189,7 @@ def main(args):
 
     running_loss, log_steps = 0.0, 0
     running_trunk, running_head = 0.0, 0.0
+    running_err, running_reveal = 0.0, 0.0
     t_log = time.time()
     H = W = latent_size
 
@@ -233,6 +234,10 @@ def main(args):
                 running_trunk += comps["loss_trunk"].item()
             if "loss_head" in comps:
                 running_head += comps["loss_head"].item()
+            if "glat_err_rate" in comps:
+                running_err += comps["glat_err_rate"].item()
+            if "glat_reveal_frac" in comps:
+                running_reveal += comps["glat_reveal_frac"].item()
             log_steps += 1
             train_steps += 1
 
@@ -248,6 +253,12 @@ def main(args):
                 avg_head = torch.tensor(running_head / log_steps, device=device)
                 dist.all_reduce(avg_head, op=dist.ReduceOp.SUM)
                 avg_head = avg_head.item() / dist.get_world_size()
+                avg_err = torch.tensor(running_err / log_steps, device=device)
+                dist.all_reduce(avg_err, op=dist.ReduceOp.SUM)
+                avg_err = avg_err.item() / dist.get_world_size()
+                avg_reveal = torch.tensor(running_reveal / log_steps, device=device)
+                dist.all_reduce(avg_reveal, op=dist.ReduceOp.SUM)
+                avg_reveal = avg_reveal.item() / dist.get_world_size()
                 steps_per_sec = log_steps / dt
                 time_per_step = dt / log_steps
                 remaining_steps = total_steps - train_steps
@@ -257,6 +268,7 @@ def main(args):
                 logger.info(f"step={train_steps:07d}/{total_steps} loss={avg_loss:.4f} "
                             f"trunk={avg_trunk:.4f} head={avg_head:.4f} "
                             f"gap={avg_trunk - avg_head:+.4f} "
+                            f"glat_err={avg_err:.3f} reveal={avg_reveal:.3f} "
                             f"lr={cur_lr:.2e} "
                             f"steps/s={steps_per_sec:.2f} epoch={epoch}/{args.epochs} "
                             f"eta={eta_string}")
@@ -267,6 +279,8 @@ def main(args):
                         "train/loss_trunk": avg_trunk,
                         "train/loss_head": avg_head,
                         "train/loss_gap_trunk_minus_head": avg_trunk - avg_head,
+                        "train/glat_err_rate": avg_err,
+                        "train/glat_reveal_frac": avg_reveal,
                         "train/lr": cur_lr,
                         "train/steps_per_sec": steps_per_sec,
                         "train/epoch": epoch,
@@ -275,6 +289,7 @@ def main(args):
 
                 running_loss, log_steps, t_log = 0.0, 0, time.time()
                 running_trunk, running_head = 0.0, 0.0
+                running_err, running_reveal = 0.0, 0.0
 
             if train_steps % args.ckpt_every == 0 and train_steps > 0 and rank == 0:
                 target = model.module._orig_mod if not args.no_compile else model.module

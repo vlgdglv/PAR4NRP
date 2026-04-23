@@ -85,7 +85,7 @@ class RowARArgs:
     # Tiny within-row AR head. Trunk predicts row r in parallel (factorized
     # marginals); head walks across the W columns and conditions on previously
     # sampled tokens of the same row, so inference is no longer factorized.
-    use_head: bool = True
+    use_head: bool = False
     head_dim: int = 384
     head_n_layer: int = 2
     head_n_head: int = 6
@@ -94,6 +94,18 @@ class RowARArgs:
     # within-row work to the head and stops its hidden states from drifting
     # into an arbitrary internal code only the head can read.
     trunk_loss_weight: float = 1.0
+
+    # GLAT (glancing training, Qian et al. 2021) --- single-forward inference,
+    # two-pass training. Pass 1 (no grad): factorized predictions on each row,
+    # count Hamming mismatches vs GT. Pass 2: reveal a fraction of GT tokens
+    # (proportional to pass-1 error) by adding tok_emb(row_r) + reveal_flag_emb
+    # to the block-r input at revealed positions. CE is taken only on the
+    # un-revealed positions, so the trunk is still trained to predict row-r
+    # marginals from x_<r alone, but its hidden states are forced to encode
+    # partial-row joint structure --- which carries through to inference (no
+    # reveals) and tightens the factorized marginals against each other.
+    use_glat: bool = True
+    glat_lambda: float = 0.5
 
 
 class RowARBlock(nn.Module):
@@ -326,6 +338,14 @@ class RowARTransformer(nn.Module):
                 initializer_range=config.initializer_range,
             )
 
+        # GLAT: one learned embedding added to revealed-position inputs so the
+        # model can tell "this slot's input is same-row GT" apart from the
+        # default "this slot's input is prev-row token".
+        self.use_glat = config.use_glat
+        self.glat_lambda = config.glat_lambda
+        if self.use_glat:
+            self.reveal_flag_emb = nn.Parameter(torch.zeros(config.dim))
+
         head_dim = config.dim // config.n_head
         self.register_buffer(
             "freqs_cis",
@@ -345,6 +365,8 @@ class RowARTransformer(nn.Module):
         # Random init for output head (warm-start usually overwrites it; if it
         # silently doesn't, std=0.02 init is the safe fallback).
         nn.init.normal_(self.bos_row, mean=0.0, std=self.config.initializer_range)
+        if getattr(self, "use_glat", False):
+            nn.init.normal_(self.reveal_flag_emb, mean=0.0, std=self.config.initializer_range)
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -356,9 +378,11 @@ class RowARTransformer(nn.Module):
             module.weight.data.normal_(mean=0.0, std=std)
 
     # ---------------------------------------------------------------- helpers
-    def _build_block_inputs(self, tokens: torch.Tensor) -> torch.Tensor:
+    def _build_block_inputs(self, tokens: torch.Tensor, reveal_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """tokens: [B, H, W] long. Returns [B, H*W, dim] block inputs.
-        Block r input: tok_emb(tokens[:, r-1, :]) for r >= 1, bos_row for r = 0.
+        Base: block r input at col c = tok_emb(tokens[r-1, c]) for r >= 1, bos_row for r = 0.
+        If reveal_mask: [B, H, W] bool is provided (GLAT pass 2), the revealed
+        positions get an additive channel = tok_emb(tokens[r, c]) + reveal_flag_emb.
         """
         B, H, W = tokens.shape
         prev = torch.empty_like(tokens)
@@ -366,6 +390,10 @@ class RowARTransformer(nn.Module):
         prev[:, 0, :] = 0  # placeholder, overwritten below by bos_row
         emb = self.tok_embeddings(prev)              # [B, H, W, dim]
         emb[:, 0, :, :] = self.bos_row.view(1, 1, -1).expand(B, W, -1)
+        if reveal_mask is not None and getattr(self, "use_glat", False):
+            cur_emb = self.tok_embeddings(tokens)                                  # [B, H, W, dim]
+            m = reveal_mask.unsqueeze(-1).to(cur_emb.dtype)                        # [B, H, W, 1]
+            emb = emb + m * (cur_emb + self.reveal_flag_emb.view(1, 1, 1, -1))
         return emb.reshape(B, H * W, -1)
 
     # ---------------------------------------------------------------- forward
@@ -377,6 +405,8 @@ class RowARTransformer(nn.Module):
         targets: Optional[torch.Tensor] = None,    # [B, H*W] long
     ):
         if self.training or tokens is not None:
+            if getattr(self, "use_glat", False):
+                return self._forward_train_glat(tokens, class_idx, targets)
             return self._forward_train(tokens, class_idx, targets)
         return self._forward_step(prev_rows, class_idx)
 
@@ -433,6 +463,70 @@ class RowARTransformer(nn.Module):
             logits = trunk_logits.reshape(B, H * W, -1)
 
         return logits, loss
+
+    # ---------------------------------------------------------------- GLAT
+    def _forward_train_glat(self, tokens, class_idx, targets):
+        """Glancing training: two trunk forwards.
+
+        Pass 1 (no_grad): predict row tokens factorized, count Hamming errors.
+        Per-row reveal probability = glat_lambda * row_error_rate (Qian et al.).
+        Pass 2 (with grad): same trunk forward, but block-r input at the
+        revealed positions has tok_emb(row_r) + reveal_flag_emb additively
+        injected. CE loss only on the un-revealed positions, so the trunk is
+        still trained on pure-x_<r marginals --- but its hidden states learn
+        to produce marginals that are *consistent with arbitrary partial row-r
+        observations*, which carries into single-forward inference.
+        """
+        B, H, W = tokens.shape
+        assert (H, W) == (self.H, self.W)
+        device = tokens.device
+
+        # Compute conditioning ONCE so pass 1 and pass 2 see the same class
+        # dropout realization (LabelEmbedder applies stochastic CFG dropout
+        # internally; otherwise pass-1 error stats would be measured under a
+        # different conditional than pass-2 training).
+        cls_emb = self.cls_embedding(class_idx, train=self.training)[:, :self.cls_token_num]  # [B,1,d]
+        attn_mask = self.attn_mask.to(device).unsqueeze(0).unsqueeze(0)
+        freqs_cis = self.freqs_cis.to(device)
+
+        def trunk_fwd(reveal_mask):
+            block_inputs = self._build_block_inputs(tokens, reveal_mask=reveal_mask)
+            h = torch.cat([cls_emb, block_inputs], dim=1)
+            h = self.tok_dropout(h)
+            for layer in self.layers:
+                h = layer(h, freqs_cis, attn_mask)
+            h = self.norm(h)
+            return self.output(h[:, 1:, :]).float()                                  # [B, H*W, V]
+
+        # ---- Pass 1: no reveals, error count -------------------------------
+        with torch.no_grad():
+            logits1 = trunk_fwd(reveal_mask=None)
+            preds1 = logits1.argmax(-1).view(B, H, W)
+            err = (preds1 != tokens).float()                                          # [B, H, W]
+            err_rate_per_row = err.mean(-1, keepdim=True)                             # [B, H, 1]
+            reveal_prob = (self.glat_lambda * err_rate_per_row).clamp(max=1.0)        # [B, H, 1]
+            reveal_prob = reveal_prob.expand(B, H, W).contiguous()
+            reveal_mask = torch.bernoulli(reveal_prob).bool()                         # [B, H, W]
+
+        # ---- Pass 2: with reveals, CE on un-revealed -----------------------
+        logits2 = trunk_fwd(reveal_mask=reveal_mask)
+        V = logits2.size(-1)
+        if targets is None:
+            targets = tokens.reshape(B, H * W)
+        loss_keep = (~reveal_mask).view(B, H * W).float()                             # 1 = un-revealed
+        ce = F.cross_entropy(
+            logits2.reshape(-1, V), targets.reshape(-1), reduction="none"
+        ).view(B, H * W)
+        n_keep = loss_keep.sum().clamp(min=1.0)
+        loss = (ce * loss_keep).sum() / n_keep
+
+        self.last_loss_components = {
+            # Reuse "loss_trunk" name so existing trainer logging picks it up.
+            "loss_trunk": loss.detach(),
+            "glat_err_rate": err.mean().detach(),
+            "glat_reveal_frac": reveal_mask.float().mean().detach(),
+        }
+        return logits2, loss
 
     # ---------------------------------------------------------------- sampling
     @torch.no_grad()
