@@ -338,13 +338,12 @@ class RowARTransformer(nn.Module):
                 initializer_range=config.initializer_range,
             )
 
-        # GLAT: one learned embedding added to revealed-position inputs so the
-        # model can tell "this slot's input is same-row GT" apart from the
-        # default "this slot's input is prev-row token".
+        # GLAT (random-reveal training): no extra parameters. Revealed-position
+        # inputs are simply REPLACED with the same-row GT tok_emb (canonical
+        # NAT/CMLM design). Bidirectional within-row attention propagates the
+        # GT info to un-revealed positions; loss is masked at revealed slots.
         self.use_glat = config.use_glat
         self.glat_lambda = config.glat_lambda
-        if self.use_glat:
-            self.reveal_flag_emb = nn.Parameter(torch.zeros(config.dim))
 
         head_dim = config.dim // config.n_head
         self.register_buffer(
@@ -365,8 +364,6 @@ class RowARTransformer(nn.Module):
         # Random init for output head (warm-start usually overwrites it; if it
         # silently doesn't, std=0.02 init is the safe fallback).
         nn.init.normal_(self.bos_row, mean=0.0, std=self.config.initializer_range)
-        if getattr(self, "use_glat", False):
-            nn.init.normal_(self.reveal_flag_emb, mean=0.0, std=self.config.initializer_range)
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -381,8 +378,12 @@ class RowARTransformer(nn.Module):
     def _build_block_inputs(self, tokens: torch.Tensor, reveal_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """tokens: [B, H, W] long. Returns [B, H*W, dim] block inputs.
         Base: block r input at col c = tok_emb(tokens[r-1, c]) for r >= 1, bos_row for r = 0.
-        If reveal_mask: [B, H, W] bool is provided (GLAT pass 2), the revealed
-        positions get an additive channel = tok_emb(tokens[r, c]) + reveal_flag_emb.
+        If reveal_mask: [B, H, W] bool is provided (GLAT), the revealed positions
+        have their input REPLACED with tok_emb(tokens[r, c]) -- the same-row GT
+        embedding -- following the canonical NAT MT / CMLM / MaskGIT design. No
+        flag/marker is needed: bidirectional within-row attention lets the
+        un-revealed positions read these GT embeddings, and the loss is masked
+        at revealed positions so the model can't shortcut by copying input -> output.
         """
         B, H, W = tokens.shape
         prev = torch.empty_like(tokens)
@@ -392,8 +393,8 @@ class RowARTransformer(nn.Module):
         emb[:, 0, :, :] = self.bos_row.view(1, 1, -1).expand(B, W, -1)
         if reveal_mask is not None and getattr(self, "use_glat", False):
             cur_emb = self.tok_embeddings(tokens)                                  # [B, H, W, dim]
-            m = reveal_mask.unsqueeze(-1).to(cur_emb.dtype)                        # [B, H, W, 1]
-            emb = emb + m * (cur_emb + self.reveal_flag_emb.view(1, 1, 1, -1))
+            m = reveal_mask.unsqueeze(-1)                                           # [B, H, W, 1]
+            emb = torch.where(m, cur_emb, emb)
         return emb.reshape(B, H * W, -1)
 
     # ---------------------------------------------------------------- forward
