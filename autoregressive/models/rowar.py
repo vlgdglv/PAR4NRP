@@ -466,67 +466,56 @@ class RowARTransformer(nn.Module):
 
     # ---------------------------------------------------------------- GLAT
     def _forward_train_glat(self, tokens, class_idx, targets):
-        """Glancing training: two trunk forwards.
+        """GLAT-lite: single-pass random-reveal training.
 
-        Pass 1 (no_grad): predict row tokens factorized, count Hamming errors.
-        Per-row reveal probability = glat_lambda * row_error_rate (Qian et al.).
-        Pass 2 (with grad): same trunk forward, but block-r input at the
-        revealed positions has tok_emb(row_r) + reveal_flag_emb additively
-        injected. CE loss only on the un-revealed positions, so the trunk is
-        still trained on pure-x_<r marginals --- but its hidden states learn
-        to produce marginals that are *consistent with arbitrary partial row-r
-        observations*, which carries into single-forward inference.
+        Per row, sample reveal rate r ~ Uniform(0, glat_lambda). Bernoulli(r)
+        per column: revealed positions get an additive same-row-GT channel
+        (tok_emb(row_r) + reveal_flag_emb) on top of the default prev-row
+        input. CE on un-revealed positions only.
+
+        Why not GLAT-proper (two-pass, error-adaptive reveal): VQ-16K top-1 is
+        noise-dominated (visually-near-equivalent codebook entries), so the
+        pass-1 Hamming signal is unreliable and reveal_frac stays pinned high.
+        Random reveal with bounded r_max gives the same "learn marginals under
+        partial row evidence" pressure at half the compute and without the
+        noisy-error dependency. r ~ U(0, r_max) includes r=0 (pure original
+        CE) with positive density, so inference (no reveals) is part of the
+        training distribution.
         """
         B, H, W = tokens.shape
         assert (H, W) == (self.H, self.W)
         device = tokens.device
 
-        # Compute conditioning ONCE so pass 1 and pass 2 see the same class
-        # dropout realization (LabelEmbedder applies stochastic CFG dropout
-        # internally; otherwise pass-1 error stats would be measured under a
-        # different conditional than pass-2 training).
+        r_max = self.glat_lambda                                                       # 0.5 default
+        r_per_row = torch.rand(B, H, 1, device=device) * r_max                         # [B, H, 1]
+        reveal_mask = torch.bernoulli(r_per_row.expand(B, H, W)).bool()                # [B, H, W]
+
         cls_emb = self.cls_embedding(class_idx, train=self.training)[:, :self.cls_token_num]  # [B,1,d]
+        block_inputs = self._build_block_inputs(tokens, reveal_mask=reveal_mask)              # [B,H*W,d]
+        h = torch.cat([cls_emb, block_inputs], dim=1)
+        h = self.tok_dropout(h)
         attn_mask = self.attn_mask.to(device).unsqueeze(0).unsqueeze(0)
         freqs_cis = self.freqs_cis.to(device)
+        for layer in self.layers:
+            h = layer(h, freqs_cis, attn_mask)
+        h = self.norm(h)
+        logits = self.output(h[:, 1:, :]).float()                                      # [B, H*W, V]
 
-        def trunk_fwd(reveal_mask):
-            block_inputs = self._build_block_inputs(tokens, reveal_mask=reveal_mask)
-            h = torch.cat([cls_emb, block_inputs], dim=1)
-            h = self.tok_dropout(h)
-            for layer in self.layers:
-                h = layer(h, freqs_cis, attn_mask)
-            h = self.norm(h)
-            return self.output(h[:, 1:, :]).float()                                  # [B, H*W, V]
-
-        # ---- Pass 1: no reveals, error count -------------------------------
-        with torch.no_grad():
-            logits1 = trunk_fwd(reveal_mask=None)
-            preds1 = logits1.argmax(-1).view(B, H, W)
-            err = (preds1 != tokens).float()                                          # [B, H, W]
-            err_rate_per_row = err.mean(-1, keepdim=True)                             # [B, H, 1]
-            reveal_prob = (self.glat_lambda * err_rate_per_row).clamp(max=1.0)        # [B, H, 1]
-            reveal_prob = reveal_prob.expand(B, H, W).contiguous()
-            reveal_mask = torch.bernoulli(reveal_prob).bool()                         # [B, H, W]
-
-        # ---- Pass 2: with reveals, CE on un-revealed -----------------------
-        logits2 = trunk_fwd(reveal_mask=reveal_mask)
-        V = logits2.size(-1)
+        V = logits.size(-1)
         if targets is None:
             targets = tokens.reshape(B, H * W)
-        loss_keep = (~reveal_mask).view(B, H * W).float()                             # 1 = un-revealed
+        loss_keep = (~reveal_mask).view(B, H * W).float()                              # 1 = un-revealed
         ce = F.cross_entropy(
-            logits2.reshape(-1, V), targets.reshape(-1), reduction="none"
+            logits.reshape(-1, V), targets.reshape(-1), reduction="none"
         ).view(B, H * W)
         n_keep = loss_keep.sum().clamp(min=1.0)
         loss = (ce * loss_keep).sum() / n_keep
 
         self.last_loss_components = {
-            # Reuse "loss_trunk" name so existing trainer logging picks it up.
             "loss_trunk": loss.detach(),
-            "glat_err_rate": err.mean().detach(),
             "glat_reveal_frac": reveal_mask.float().mean().detach(),
         }
-        return logits2, loss
+        return logits, loss
 
     # ---------------------------------------------------------------- sampling
     @torch.no_grad()
