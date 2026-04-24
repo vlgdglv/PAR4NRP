@@ -85,9 +85,9 @@ class RowARArgs:
     # Tiny within-row AR head. Trunk predicts row r in parallel (factorized
     # marginals); head walks across the W columns and conditions on previously
     # sampled tokens of the same row, so inference is no longer factorized.
-    use_head: bool = False
+    use_head: bool = True
     head_dim: int = 384
-    head_n_layer: int = 2
+    head_n_layer: int = 1
     head_n_head: int = 6
     # Loss weight on trunk's own factorized CE. Head loss is always 1.0.
     # Keeping trunk loss > 0 prevents the trunk from "outsourcing" all
@@ -104,7 +104,7 @@ class RowARArgs:
     # marginals from x_<r alone, but its hidden states are forced to encode
     # partial-row joint structure --- which carries through to inference (no
     # reveals) and tightens the factorized marginals against each other.
-    use_glat: bool = True
+    use_glat: bool = False
     glat_lambda: float = 0.5
 
 
@@ -337,6 +337,7 @@ class RowARTransformer(nn.Module):
                 W=config.grid_w,
                 initializer_range=config.initializer_range,
             )
+            print("[INFO] Using TinyAR Head!")
 
         # GLAT (random-reveal training): no extra parameters. Revealed-position
         # inputs are simply REPLACED with the same-row GT tok_emb (canonical

@@ -49,14 +49,15 @@ torchrun --nproc_per_node=${NPROC} --master_port=${MASTER_PORT:-29503} \
 # python evaluations/c2i/evaluator.py /jizhicfs/pkuhetu/bht/data/imagenet-1k/VIRTUAL_imagenet256_labeled.npz inference_outputs/RowAR-B-0015000-ema-size256-eval256-cfg4.0-topk0-topp1.0-t1.0-seed0-n10000.npz
 
 
-# for CFG in 1.0 1.25 1.5 1.75 2.0 2.5; do
-#     GPT_CKPT=/dockerdata/bht/LlamaGenNRP/rowar_b_256_fast/rowar-b-img256-bs2048-lr2e-04-ep60-wu1000-ema-llamagen/checkpoints/0035000.pt SAMPLE_DIR=inference_outputs/samples_60ep_cfg${CFG} CFG=${CFG} N=10000 bash scripts/autoregressive/sample_c2i_rowar_ddp.sh
+# for CFG in 1.0 2.0 3.0 4.0; do
+#     GPT_CKPT=/dockerdata/bht/LlamaGenNRP/rowar_b_256_tar/rowar-b-img256-bs2048-lr2e-04-ep25-wu1000-ema-llamagen/checkpoints/0015000.pt SAMPLE_DIR=inference_outputs/samples_25ep_b_tar_img256_cfg${CFG} CFG=${CFG} N=2500 bash scripts/autoregressive/sample_c2i_rowar_ddp.sh
 # done
 
 
-for CFG in 1.0 1.25 1.5 1.75 2.0 2.5; do
-    python -m evaluations.c2i.evaluator /jizhicfs/pkuhetu/bht/data/imagenet-1k/VIRTUAL_imagenet256_labeled.npz \
-        inference_outputs/samples_60ep_cfg${CFG}/RowAR-B-0035000-ema-size256-eval256-cfg${CFG}-topk0-topp1.0-t1.0-seed0-n10000.npz
-done
+# for CFG in  1.0 2.0 3.0 4.0; do
+#     python -m evaluations.c2i.evaluator /jizhicfs/pkuhetu/bht/data/imagenet-1k/VIRTUAL_imagenet256_labeled.npz \
+#           inference_outputs/samples_25ep_b_tar_img256_cfg${CFG}/RowAR-XL-0015000-ema-size384-eval256-cfg${CFG}-topk0-topp1.0-t1.0-seed0-n2500.npz
+# done
 
 # # 
+
