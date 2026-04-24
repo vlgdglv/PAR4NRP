@@ -62,13 +62,11 @@ def main(args):
     # ---- RowAR ----
     latent_size = args.image_size // args.downsample_size
     precision = {"none": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
-    model = RowAR_models[args.gpt_model](
-        vocab_size=args.codebook_size,
-        num_classes=args.num_classes,
-        grid_h=latent_size,
-        grid_w=latent_size,
-        cls_token_num=args.cls_token_num,
-    ).to(device=device, dtype=precision).eval()
+
+    # Auto-detect whether the ckpt contains a trained AR head, so we rebuild
+    # the model with use_head=True / use_glat=False and don't silently drop
+    # head.* weights on load. (Training toggles these via RowARArgs defaults;
+    # inference must mirror the ckpt's actual architecture.)
     ckpt = torch.load(args.gpt_ckpt, map_location="cpu")
     if "ema" in ckpt and args.use_ema:
         sd = ckpt["ema"]
@@ -78,9 +76,26 @@ def main(args):
         sd = ckpt["state_dict"]
     else:
         sd = ckpt
+    has_head_in_ckpt = any(k.startswith("head.") for k in sd.keys())
+    if rank == 0:
+        print(f"[info] ckpt has AR head: {has_head_in_ckpt}")
+
+    model = RowAR_models[args.gpt_model](
+        vocab_size=args.codebook_size,
+        num_classes=args.num_classes,
+        grid_h=latent_size,
+        grid_w=latent_size,
+        cls_token_num=args.cls_token_num,
+        use_head=has_head_in_ckpt,
+        use_glat=False,  # GLAT is training-time only
+    ).to(device=device, dtype=precision).eval()
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if rank == 0:
         print(f"loaded ckpt. missing={len(missing)} unexpected={len(unexpected)}")
+        if unexpected:
+            print(f"[warn] unexpected keys (first 5): {unexpected[:5]}")
+        if missing:
+            print(f"[warn] missing keys (first 5): {missing[:5]}")
     del ckpt
 
     # ---- output dir ----
